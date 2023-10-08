@@ -5,9 +5,8 @@ use std::f32::consts::PI;
 use std::ptr::null_mut;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{thread, u8};
+use std::{thread, time, u8};
 
-use opencv::types::VectorOfu8;
 use windows::core::Interface;
 use windows::core::HSTRING;
 use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapEncoder, BitmapPixelFormat};
@@ -22,60 +21,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     self, CallNextHookEx, MSG, WINDOWS_HOOK_ID, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 
-use opencv::core::{Mat, Point2f, BORDER_CONSTANT};
-use opencv::imgproc;
-use opencv::prelude::*;
-
-mod capture;
-mod window_info;
-
-#[derive(Debug)]
-struct Hit {
-    indicator: u32,
-    range: [u32; 2],
+#[derive(Debug, Clone)]
+struct Rad {
+    hit_zone: Vec<u32>,
 }
 
 fn main() {
     let hwnd = unsafe { WindowsAndMessaging::GetDesktopWindow() };
-    let mut hit = Hit {
-        indicator: 0,
-        range: [0, 0],
-    };
-
-    // 保留以下代码用来优化
-    //
-    // let mouse_hook = unsafe {
-    //     WindowsAndMessaging::SetWindowsHookExA(WINDOWS_HOOK_ID(14), Some(mouse_hook_proc), None, 0)
-    // };
-
-    // // 消息循环
-    // let mut msg = MSG::default();
-    // while unsafe { WindowsAndMessaging::GetMessageA(&mut msg, None, 0, 0) }.0 > 0 {
-    //     unsafe {
-    //         WindowsAndMessaging::TranslateMessage(&msg);
-    //         WindowsAndMessaging::DispatchMessageA(&msg);
-    //     }
-    // }
-
-    // unsafe {
-    //     let _ = match mouse_hook {
-    //         Ok(hook) => {
-    //             WindowsAndMessaging::UnhookWindowsHookEx(hook);
-    //         }
-    //         Err(_) => (),
-    //     };
-    // }
+    let mut rad = Rad { hit_zone: vec![] };
 
     let handle = thread::spawn(move || loop {
+        let duration = time::Duration::from_millis(30);
+        thread::sleep(duration);
         if unsafe { GetAsyncKeyState(1) } != 0 {
-            screenshot_by_hwnd(hwnd, &mut hit).unwrap();
+            screenshot_by_hwnd(hwnd, &mut rad).unwrap();
         }
     });
 
     handle.join().unwrap();
 }
 
-fn screenshot_by_hwnd(hwnd: HWND, hit_share: &mut Hit) -> Result<(), Box<dyn Error>> {
+fn screenshot_by_hwnd(hwnd: HWND, rad: &mut Rad) -> Result<(), Box<dyn Error>> {
     Ok(unsafe {
         let hdc = Gdi::GetWindowDC(hwnd);
         let mut rect = RECT::default();
@@ -143,64 +109,107 @@ fn screenshot_by_hwnd(hwnd: HWND, hit_share: &mut Hit) -> Result<(), Box<dyn Err
         let width = diameter;
         let height = diameter;
         let mut rotated_buffer: Vec<u8> = vec![0; (width * height * 4) as usize];
+        let prev_rad = rad.clone();
 
         let now = std::time::SystemTime::now();
 
-        for angle in 1..360 {
-            // 优化执行耗时
-            if angle % 2 == 0 {
-                continue;
-            }
-            rotated_buffer = rotate_img_buffer(&mut buffer, angle as f64)?;
+        let r = radius;
+        let center_x = r;
+        let center_y = r;
+        let num_points = 360;
+        let max_len = buffer.len() as i32;
+        let mut white_zone: Vec<u32> = vec![];
+        let mut red_zone: Vec<u32> = vec![];
 
-            let mut count = 0;
-            let mut rows_iter = (1..11).into_iter();
-            let mut row_num = rows_iter.next();
+        // 设置中间圆心为蓝色
+        buffer[((center_y * width + center_x) * 4) as usize] = 255;
+        buffer[((center_y * width + center_x) * 4 + 1) as usize] = 0;
+        buffer[((center_y * width + center_x) * 4 + 2) as usize] = 0;
+        buffer[((center_y * width + center_x) * 4 + 3) as usize] = 255;
 
-            for pixel in rotated_buffer.chunks(4) {
-                if row_num.is_none() {
-                    break;
+        for i in 0..num_points {
+            let angle = (i as f32) * 2.0 * PI / (num_points as f32);
+
+            let x = (center_x as f32) + (r as f32) * angle.cos();
+            let y = (center_y as f32) + (r as f32) * angle.sin();
+            let mut x = x.floor() as i32;
+            let mut y = y.floor() as i32;
+
+            let dest_index = (y * width + x) * 4;
+            if dest_index < max_len {
+                let red = buffer[(dest_index + 2) as usize];
+                let green = buffer[(dest_index + 1) as usize];
+                let blue = buffer[(dest_index) as usize];
+
+                if x > r && y < r {
+                    x = x - r;
+                    y = r - y;
                 }
-                if count == radius * row_num.unwrap() {
-                    row_num = rows_iter.next();
-                    if pixel[3] == 0 || pixel[3] != 255 {
-                        continue;
-                    }
-                    // RGBA -> 2103
-                    if pixel[0] < 50 && pixel[1] < 50 && pixel[2] > 200 {
-                        hit_share.indicator = angle;
-                    }
-                    if pixel[0] > 240 && pixel[1] > 240 && pixel[2] > 240 {
-                        if hit_share.range == [0, 0] {
-                            hit_share.range = [angle, angle];
-                        } else if angle < hit_share.range[0] {
-                            hit_share.range[0] = angle;
-                        } else if angle > hit_share.range[1] {
-                            hit_share.range[1] = angle;
-                        }
-                    }
+                if x > r && y > r {
+                    x = x - r;
+                    y = y - r;
                 }
-                count += 1;
+                if x < r && y > r {
+                    x = r - x;
+                    y = y - r;
+                }
+                if x < r && y < r {
+                    x = r - x;
+                    y = r - y;
+                }
+
+                // 类白色
+                if red > 240 && green > 240 && blue > 240 {
+                    let theta = 2.0
+                        * (((x - 0).pow(2) as f64 + (y - r).pow(2) as f64).sqrt()
+                            / (2.0 * r as f64))
+                            .asin();
+
+                    let l = (2.0 * (r as f32) * (theta as f32) * PI);
+                    white_zone.push(l as u32);
+                    println!("白色弧长 {}", l);
+                }
+
+                // 类红色
+                if red > 200 && green < 50 && blue < 50 {
+                    let theta = 2.0
+                        * (((x - 0).pow(2) as f64 + (y - r).pow(2) as f64).sqrt()
+                            / (2.0 * r as f64))
+                            .asin();
+
+                    let l = (2.0 * (r as f32) * (theta as f32) * PI);
+                    red_zone.push(l as u32);
+                    println!("红色弧长 {}", l);
+                }
             }
         }
 
-        {
-            // 在此进行触发 SPACE
-            let indicator_degree = hit_share.indicator;
-            let white_region = hit_share.range;
-            if white_region[0] != 0
-                && indicator_degree > white_region[0]
-                && indicator_degree < white_region[1]
-            {
-                let _ = press_space();
-                println!(
-                    "红色命中: {} / 白色区域范围 [{}, {}]",
-                    indicator_degree, white_region[0], white_region[1]
-                );
+        if red_zone.len() == 0 {
+            rad.hit_zone = vec![];
+        }
 
-                hit_share.range = [0, 0];
-                hit_share.indicator = 0;
-                // save_buffer_to_image(diameter as u32, diameter as u32, &rotated_buffer)?;
+        if red_zone.len() != 0 && rad.hit_zone.len() == 0 {
+            rad.hit_zone = white_zone;
+        }
+
+        if rad.hit_zone.len() >= 2 {
+            let first_index = 0;
+            let hit_last_index = rad.hit_zone.len() - 1;
+            let last_index = red_zone.len() - 1;
+
+            if rad.hit_zone[hit_last_index] < rad.hit_zone[first_index] {
+                rad.hit_zone.sort();
+            }
+            if red_zone[last_index] < red_zone[first_index] {
+                red_zone.sort();
+            }
+
+            if rad.hit_zone[first_index] < red_zone[first_index]
+                && rad.hit_zone[hit_last_index] > red_zone[last_index]
+            {
+                println!("命中了阿");
+                // let _ = press_space();
+                let _ = save_buffer_to_image(width as u32, width as u32, &buffer);
             }
         }
 
@@ -240,41 +249,6 @@ fn save_buffer_to_image(width: u32, height: u32, buffer: &Vec<u8>) -> Result<(),
     Ok(())
 }
 
-fn rotate_img_buffer(buffer: &mut Vec<u8>, angle: f64) -> opencv::Result<Vec<u8>, Box<dyn Error>> {
-    let img = unsafe {
-        Mat::new_rows_cols_with_data(
-            174,
-            174,
-            opencv::core::CV_8UC4,
-            buffer.as_mut_ptr() as *mut std::ffi::c_void,
-            opencv::core::Mat_AUTO_STEP,
-        )?
-    };
-
-    let center = Point2f::new(img.cols() as f32 / 2.0, img.rows() as f32 / 2.0);
-
-    let rot_matrix = imgproc::get_rotation_matrix_2d(center, angle, 1.0)?;
-
-    let mut rotated_img = img.clone();
-
-    imgproc::warp_affine(
-        &img,
-        &mut rotated_img,
-        &rot_matrix,
-        img.size()?,
-        imgproc::INTER_LINEAR,
-        opencv::core::BORDER_CONSTANT,
-        Default::default(),
-    )?;
-    let img_data_ptr = rotated_img.data();
-
-    let img_data_size =
-        (rotated_img.rows() * rotated_img.cols() * rotated_img.elem_size()? as i32) as usize;
-
-    let img_vec: Vec<u8> = unsafe { slice::from_raw_parts(img_data_ptr, img_data_size).to_vec() };
-    Ok(img_vec)
-}
-
 fn press_space() -> windows::core::Result<()> {
     let mut input_down: INPUT = INPUT::default();
     let key_input = KEYBDINPUT {
@@ -304,20 +278,3 @@ fn press_space() -> windows::core::Result<()> {
 }
 
 // pub type HOOKPROC = Option<unsafe extern "system" fn(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT>;
-unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        if wparam == WPARAM(WM_LBUTTONDOWN as usize) {
-            let time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            println!("鼠标左键按下啦 {} ", time);
-        }
-
-        if wparam == WPARAM(WM_LBUTTONUP as usize) {
-            println!("鼠标左键松开啦");
-        }
-    }
-
-    CallNextHookEx(None, code, wparam, lparam)
-}
