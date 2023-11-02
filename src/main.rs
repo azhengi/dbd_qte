@@ -19,12 +19,15 @@ use windows::Storage::{CreationCollisionOption, FileAccessMode, StorageFolder};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{self, XFORM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    self, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAP_VIRTUAL_KEY_TYPE, VIRTUAL_KEY, VK_LBUTTON, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    self, CallNextHookEx, MSG, WINDOWS_HOOK_ID, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    self, GWLP_USERDATA, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WINDOWS_HOOK_ID, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
+
+mod utils;
 
 #[derive(Debug, Clone)]
 struct ArcZone {
@@ -42,7 +45,7 @@ impl ArcZone {
             return false;
         }
 
-        if self.segment[0] <= other[0] && self.segment[seg_len - 1] >= other[other_len - 1] {
+        if self.segment[0] - 6 <= other[0] && self.segment[seg_len - 1] >= other[other_len - 1] {
             return true;
         }
         false
@@ -52,12 +55,7 @@ impl ArcZone {
 fn main() {
     let hwnd = unsafe { WindowsAndMessaging::GetDesktopWindow() };
     let mut arc_zone = ArcZone::new();
-
     let handle = thread::spawn(move || loop {
-        // if unsafe { GetAsyncKeyState(1) } != 0 {
-        // }
-        let duration = time::Duration::from_millis(30);
-        thread::sleep(duration);
         screenshot_by_hwnd(hwnd, &mut arc_zone).unwrap();
     });
 
@@ -139,8 +137,6 @@ fn screenshot_by_hwnd(hwnd: HWND, arc_zone: &mut ArcZone) -> Result<(), Box<dyn 
 
         let width = diameter;
 
-        let now = std::time::SystemTime::now();
-
         let r = radius;
         let center_x = r;
         let center_y = r;
@@ -180,7 +176,6 @@ fn screenshot_by_hwnd(hwnd: HWND, arc_zone: &mut ArcZone) -> Result<(), Box<dyn 
                 let red = buffer[(dest_index + 2) as usize];
                 let green = buffer[(dest_index + 1) as usize];
                 let blue = buffer[(dest_index) as usize];
-                let mut _0 = 0.0;
 
                 // 类白色
                 if red > 240 && green > 240 && blue > 240 {
@@ -202,10 +197,6 @@ fn screenshot_by_hwnd(hwnd: HWND, arc_zone: &mut ArcZone) -> Result<(), Box<dyn 
 
                 // 类红色
                 if red > 200 && green < 50 && blue < 50 {
-                    // buffer[(dest_index + 2) as usize] = 0;
-                    // buffer[(dest_index + 1) as usize] = 0;
-                    // buffer[(dest_index) as usize] = 255;
-
                     imgproc::line(
                         &mut img,
                         Point { x, y },
@@ -227,71 +218,26 @@ fn screenshot_by_hwnd(hwnd: HWND, arc_zone: &mut ArcZone) -> Result<(), Box<dyn 
         let arc_len = arc_zone.segment.len();
         let red_len = red_zone.len();
 
+        white_zone.retain(|x| *x > 0);
+
+        utils::may_sort_asc(&mut white_zone);
+        utils::may_sort_asc(&mut red_zone);
+
         if red_len == 0 {
             arc_zone.segment = vec![];
-        }
-
-        if red_len != 0 && arc_len == 0 {
+        } else if arc_len == 0 {
             arc_zone.segment = white_zone;
         }
 
-        if !is_sorted_asc(&arc_zone.segment) {
-            arc_zone.segment.sort();
-        }
-        if !is_sorted_asc(&red_zone) {
-            red_zone.sort();
-        }
-
-        arc_zone.segment.retain(|x| *x > 0);
-
-        if arc_zone.is_include(&red_zone) {
-            let _ = press_space();
-
+        if red_len > 0 && arc_zone.is_include(&red_zone) {
+            press_space().unwrap();
             // let img_data_ptr = img.data();
             // let img_data_size = (img.rows() * img.cols() * img.elem_size()? as i32) as usize;
 
             // let img_vec: Vec<u8> = slice::from_raw_parts(img_data_ptr, img_data_size).to_vec();
-            // let _ = save_buffer_to_image(width as u32, width as u32, img_vec);
+            // let _ = utils::save_buffer_to_image(width as u32, width as u32, img_vec);
         }
-
-        let elapsed = now.elapsed().unwrap();
-        println!("内部循环耗时: {}ms", elapsed.as_millis());
     })
-}
-
-fn save_buffer_to_image(width: u32, height: u32, buffer: Vec<u8>) -> Result<(), Box<dyn Error>> {
-    let path = std::env::current_dir()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let path = path + "\\temp";
-    let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(&path))?.get()?;
-
-    let now = std::time::SystemTime::now();
-    let since_the_epoch = now.duration_since(UNIX_EPOCH).unwrap();
-    let filename = format!("screenshot-{}.png", since_the_epoch.as_millis());
-    let file = folder
-        .CreateFileAsync(
-            &HSTRING::from(filename),
-            CreationCollisionOption::ReplaceExisting,
-        )?
-        .get()?;
-
-    let stream = file.OpenAsync(FileAccessMode::ReadWrite)?.get()?;
-    let encoder = BitmapEncoder::CreateAsync(BitmapEncoder::PngEncoderId()?, &stream)?.get()?;
-    encoder.SetPixelData(
-        BitmapPixelFormat::Bgra8,
-        BitmapAlphaMode::Premultiplied,
-        width,
-        height,
-        1.0,
-        1.0,
-        &buffer,
-    )?;
-
-    encoder.FlushAsync()?.get()?;
-
-    Ok(())
 }
 
 fn press_space() -> windows::core::Result<()> {
@@ -307,66 +253,41 @@ fn press_space() -> windows::core::Result<()> {
     input_down.Anonymous.ki = key_input;
 
     let result_down = unsafe {
-        windows::Win32::UI::Input::KeyboardAndMouse::SendInput(
-            &[input_down],
-            std::mem::size_of::<INPUT>() as i32,
-        );
+        KeyboardAndMouse::SendInput(&[input_down], std::mem::size_of::<INPUT>() as i32);
 
         input_down.Anonymous.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
 
-        windows::Win32::UI::Input::KeyboardAndMouse::SendInput(
-            &[input_down],
-            std::mem::size_of::<INPUT>() as i32,
-        )
+        KeyboardAndMouse::SendInput(&[input_down], std::mem::size_of::<INPUT>() as i32)
     };
 
     if result_down == 1 {
-        println!("SPACE 键按下成功！");
+        // println!("SPACE 键按下成功！");
     } else {
-        println!("SPACE 键按下失败！");
+        // println!("SPACE 键按下失败！");
     }
 
     Ok(())
 }
 
-fn is_sorted_asc<T: PartialOrd>(vec: &Vec<T>) -> bool {
-    for i in 1..vec.len() {
-        if vec[i] < vec[i - 1] {
-            return false;
-        }
-    }
-    true
-}
-
 fn map_arc_len(mut x: i32, mut y: i32, r: i32) -> Option<f64> {
-    let mut _0 = 0.0;
-    let mut angle_rad = 0.0;
-
     if x >= r && y <= r {
         // 1
         x = x - r;
         y = r - y;
-
-        angle_rad = f64::atan2(y as f64, x as f64);
     } else if x >= r && y >= r {
         // 4
         x = x - r;
         y = -(y - r);
-
-        angle_rad = f64::atan2(y as f64, x as f64);
     } else if x <= r && y >= r {
         // 3
         x = -(r - x);
         y = -(y - r);
-
-        angle_rad = f64::atan2(y as f64, x as f64);
     } else if x <= r && y <= r {
         // 2
         x = -(r - x);
         y = r - y;
-
-        angle_rad = f64::atan2(y as f64, x as f64);
     }
+    let angle_rad = f64::atan2(x as f64, y as f64);
 
     let clockwise_angle_rad = if angle_rad >= 0.0 {
         angle_rad
@@ -374,7 +295,7 @@ fn map_arc_len(mut x: i32, mut y: i32, r: i32) -> Option<f64> {
         2.0 * std::f64::consts::PI + angle_rad
     };
 
-    Some((r as f64) * clockwise_angle_rad as f64)
+    Some((r as f64) * clockwise_angle_rad)
 }
 
 // pub type HOOKPROC = Option<unsafe extern "system" fn(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT>;
